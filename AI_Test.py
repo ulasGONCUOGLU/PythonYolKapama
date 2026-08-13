@@ -5,6 +5,7 @@ from google import genai
 from pydantic import BaseModel
 from typing import Literal
 
+from geopy.geocoders import Nominatim
 
 # .env yükle
 load_dotenv()
@@ -42,7 +43,7 @@ class RoadAnalysis(BaseModel):
 
 # Test edeceğimiz gerçek güzergah metni
 guzergah = """
-5049 Sokak ile 6673 Sokak arasında kalan Süleyman Demirel Caddesi’ nin yan tali yolunda (Denizli Özel Cerrahi Hastanesi ile Petrol Ofisi arasında kalan kısım)
+Merkezefendi-Yenişehir Şirinköy Caddesi ile Şehit Öğretmen Yusuf Batur Caddesi arasında kalan 75 Sokak üzerinde
 """
 
 
@@ -102,3 +103,69 @@ print("Başlangıç  :", result.start_query)
 print("Bitiş      :", result.end_query)
 print("Yol sorgusu:", result.road_query)
 print("Confidence :", result.confidence)
+
+
+# --------------------------------------------------
+# GEOCODER
+# --------------------------------------------------
+
+print("\n--- GEOCODER ---")
+
+geolocator = Nominatim(
+    user_agent="YolKapama/1.0"
+)
+
+
+def geocode_query(label, query):
+    """Verilen sorguyu geocode eder ve sonucu ekrana yazdırır."""
+
+    if not query:
+        print(f"\n{label}: Sorgu yok.")
+        return None
+
+    print(f"\n{label}:")
+    print(f"Sorgu: {query}")
+
+    try:
+        location = geolocator.geocode(
+            query,
+            exactly_one=True
+        )
+
+        if location:
+            print(f"Adres: {location.address}")
+            print(f"Latitude: {location.latitude}")
+            print(f"Longitude: {location.longitude}")
+
+            return location
+
+        print("Konum bulunamadı.")
+        return None
+
+    except Exception as e:
+        print("Geocoder hatası:")
+        print(type(e).__name__)
+        print(e)
+
+        return None
+
+
+# Ana yol
+road_location = geocode_query(
+    "ANA YOL",
+    result.road_query
+)
+
+
+# Başlangıç noktası
+start_location = geocode_query(
+    "BAŞLANGIÇ NOKTASI",
+    result.start_query
+)
+
+
+# Bitiş noktası
+end_location = geocode_query(
+    "BİTİŞ NOKTASI",
+    result.end_query
+)
