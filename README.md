@@ -41,6 +41,12 @@ PowerShell kullanıyorsanız:
 ```
 .venv\Scripts\Activate.ps1
 ```
+
+Tek paket eklemek için
+```
+python -m pip install folium
+```
+
 Paketleri kurmak için:
 ```
 python -m pip install -r requirements.txt

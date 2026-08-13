@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from typing import Literal
 
 from geopy.geocoders import Nominatim
+import folium
 
 # .env yükle
 load_dotenv()
@@ -169,3 +170,108 @@ end_location = geocode_query(
     "BİTİŞ NOKTASI",
     result.end_query
 )
+
+# --------------------------------------------------
+# HARİTA
+# --------------------------------------------------
+
+
+
+print("\n--- HARİTA ---")
+
+
+# Haritada kullanılacak noktaları topla
+map_points = []
+
+if road_location:
+    map_points.append(
+        (
+            road_location.latitude,
+            road_location.longitude,
+            "Ana Yol"
+        )
+    )
+
+if start_location:
+    map_points.append(
+        (
+            start_location.latitude,
+            start_location.longitude,
+            "Başlangıç"
+        )
+    )
+
+if end_location:
+    map_points.append(
+        (
+            end_location.latitude,
+            end_location.longitude,
+            "Bitiş"
+        )
+    )
+
+
+if not map_points:
+
+    print("Harita oluşturulamadı. Hiç koordinat bulunamadı.")
+
+else:
+
+    # İlk bulunan noktayı haritanın merkezi yap
+    first_point = map_points[0]
+
+    m = folium.Map(
+        location=[
+            first_point[0],
+            first_point[1]
+        ],
+        zoom_start=15
+    )
+
+
+    # --------------------------------------------------
+    # NOKTALARI HARİTAYA EKLE
+    # --------------------------------------------------
+
+    for latitude, longitude, label in map_points:
+
+        folium.Marker(
+            location=[
+                latitude,
+                longitude
+            ],
+            popup=label
+        ).add_to(m)
+
+
+    # --------------------------------------------------
+    # BAŞLANGIÇ → BİTİŞ ÇİZGİSİ
+    # --------------------------------------------------
+
+    if start_location and end_location:
+
+        folium.PolyLine(
+            locations=[
+                [
+                    start_location.latitude,
+                    start_location.longitude
+                ],
+                [
+                    end_location.latitude,
+                    end_location.longitude
+                ]
+            ],
+            weight=5,
+            popup="Yol kapatma segmenti"
+        ).add_to(m)
+
+
+    # --------------------------------------------------
+    # HARİTAYI KAYDET
+    # --------------------------------------------------
+
+    map_file = "road_map.html"
+
+    m.save(map_file)
+
+    print(f"Harita oluşturuldu: {map_file}")
