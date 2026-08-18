@@ -11,6 +11,12 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+from google import genai
+from pydantic import BaseModel
+from typing import Literal
+
+import folium
+
 
 # ============================================================
 # AYARLAR
@@ -23,7 +29,14 @@ URL = os.getenv("URL")
 if not URL:
     raise ValueError("URL .env dosyasında bulunamadı.")
 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY .env dosyasında bulunamadı.")
+
 DB_PATH = "output/yol_kapama.db"
+
+MAP_PATH = "output/road_map.html"
 
 # Nominatim için uygulamayı tanımlayan User-Agent
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -35,6 +48,35 @@ GEOCODER_DELAY = 1.1
 
 # OSRM
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
+
+# Gemini
+GEMINI_MODEL = "gemini-3.6-flash"
+
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+
+# ============================================================
+# AI VERİ MODELİ
+# ============================================================
+
+class RoadAnalysis(BaseModel):
+    location_type: Literal[
+        "road",
+        "road_segment",
+        "intersection",
+        "address",
+        "landmark",
+        "unknown"
+    ]
+
+    road_name: str | None
+    road_query: str | None
+    start_query: str | None
+    end_query: str | None
+
+    confidence: float
 
 
 # ============================================================
@@ -669,6 +711,346 @@ def get_pending_ai_records(connection):
 
 
 # ============================================================
+# AI SONUCU KAYDEDEMEDİĞİMİZ DURUM
+# ============================================================
+
+def save_ai_error(connection, record_id, error_message):
+    """
+    AI çağrısı başarısız olduğunda kaydı 'error' olarak işaretler.
+
+    Böylece bir sonraki çalıştırmada tekrar denenebilir hale
+    getirmek istersen ai_status = 'pending' yapılabilir; şimdilik
+    başarısız denemeleri ayırt etmek için 'error' kullanıyoruz.
+    """
+
+    connection.execute(
+        """
+        UPDATE road_closures
+        SET
+            ai_status = ?,
+            ai_result = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            "error",
+            json.dumps(
+                {"error": error_message},
+                ensure_ascii=False
+            ),
+            datetime.now().isoformat(timespec="seconds"),
+            record_id
+        )
+    )
+
+    connection.commit()
+
+
+# ============================================================
+# AI PROMPT
+# ============================================================
+
+def build_ai_prompt(guzergah_raw: str) -> str:
+
+    return f"""
+Sen Denizli'deki belediyelerin yol kapatma
+duyurularını analiz eden bir konum analiz sistemisin.
+
+Görevin, verilen güzergah metnini analiz ederek geocoding
+işlemi için kullanılabilecek konum bilgilerini çıkarmaktır.
+
+Kurallar:
+
+1. Asla koordinat üretme.
+2. Asla koordinat tahmin etme.
+3. Metinde bulunmayan bir yol veya adresi gerçekmiş gibi
+   uydurma.
+4. Yolun tamamı belirtiliyorsa location_type = "road" kullan.
+5. Bir yolun başka iki nokta arasındaki bölümü belirtiliyorsa
+   location_type = "road_segment" kullan.
+6. İki yolun kesiştiği belirtiliyorsa
+   location_type = "intersection" kullan.
+7. Açık bir adres belirtiliyorsa location_type = "address" kullan.
+8. Bir bina, tesis veya bilinen nokta belirtiliyorsa
+   location_type = "landmark" kullan.
+9. Emin olmadığın durumda location_type = "unknown" kullan.
+10. Geocoder için kullanılabilecek sorguları oluştur.
+11. confidence değerini 0 ile 1 arasında ver.
+12. Metinde olmayan bilgileri uydurmak yerine ilgili alanı null bırak.
+
+Güzergah metni:
+
+{guzergah_raw}
+"""
+
+
+# ============================================================
+# AI ÇAĞRISI
+# ============================================================
+
+def analyze_route_with_ai(guzergah_raw: str):
+    """
+    Gemini'ye güzergah metnini gönderir, RoadAnalysis olarak
+    parse edilmiş sonucu döndürür.
+
+    Hata durumunda None döner.
+    """
+
+    prompt = build_ai_prompt(guzergah_raw)
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": RoadAnalysis,
+            },
+        )
+
+        return response.parsed
+
+    except Exception as e:
+        print("AI çağrısı hatası:")
+        print(type(e).__name__)
+        print(e)
+
+        return None
+
+
+# ============================================================
+# AI + GEOCODER + GEOMETRY (BEKLEYEN KAYITLARI İŞLE)
+# ============================================================
+
+def process_pending_ai(connection, pending_records):
+    """
+    Her bekleyen kayıt için:
+
+    1. Gemini ile güzergah metnini analiz eder.
+    2. Sonucu SQLite'a yazar.
+    3. Sırasıyla road_query / start_query / end_query ile
+       geocode dener, ilk başarılı sonucu ana konum olarak kaydeder.
+    4. start_query ve end_query ikisi de bulunursa OSRM ile
+       rota geometrisini alır ve kaydeder.
+    5. Sadece tek nokta bulunduysa geometry alanına Point olarak yazar.
+    """
+
+    if not pending_records:
+        print("AI analizi bekleyen kayıt yok.")
+        return
+
+    print(f"\n{len(pending_records)} kayıt için AI analizi başlıyor...")
+
+    for row in pending_records:
+
+        record_id = row[0]
+        guzergah_raw = row[1]
+
+        print(f"\n[{record_id}] {guzergah_raw}")
+
+        analysis = analyze_route_with_ai(guzergah_raw)
+
+        if analysis is None:
+            print("AI analizi başarısız, kayıt atlanıyor.")
+
+            save_ai_error(
+                connection,
+                record_id,
+                "AI analizi başarısız oldu."
+            )
+
+            continue
+
+        ai_result = {
+            "location_type": analysis.location_type,
+            "road_name": analysis.road_name,
+            "query": analysis.road_query,
+            "start_query": analysis.start_query,
+            "end_query": analysis.end_query,
+            "confidence": analysis.confidence
+        }
+
+        save_ai_result(
+            connection,
+            record_id,
+            ai_result
+        )
+
+        print(f"AI konum tipi : {analysis.location_type}")
+        print(f"Confidence    : {analysis.confidence}")
+
+        # --------------------------------------------------
+        # GEOCODING (öncelik: road_query -> start_query -> end_query)
+        # --------------------------------------------------
+
+        location_result = None
+
+        for candidate in (
+            analysis.road_query,
+            analysis.start_query,
+            analysis.end_query
+        ):
+            if not candidate:
+                continue
+
+            location_result = geocode(candidate)
+
+            if location_result:
+                break
+
+        save_geocode_result(
+            connection,
+            record_id,
+            location_result
+        )
+
+        if location_result:
+            print(f"Geocode bulundu: {location_result['display_name']}")
+        else:
+            print("Geocode bulunamadı.")
+
+        # --------------------------------------------------
+        # ROTA GEOMETRİSİ
+        # --------------------------------------------------
+
+        start_location = (
+            geocode(analysis.start_query)
+            if analysis.start_query else None
+        )
+
+        end_location = (
+            geocode(analysis.end_query)
+            if analysis.end_query else None
+        )
+
+        if start_location and end_location:
+
+            geometry = get_route_geometry(
+                start_location["latitude"],
+                start_location["longitude"],
+                end_location["latitude"],
+                end_location["longitude"]
+            )
+
+            if geometry:
+                save_geometry(
+                    connection,
+                    record_id,
+                    geometry
+                )
+
+                print("Rota geometrisi kaydedildi.")
+            else:
+                print("OSRM rota bulamadı.")
+
+        elif location_result:
+
+            point_geometry = {
+                "type": "Point",
+                "coordinates": [
+                    location_result["longitude"],
+                    location_result["latitude"]
+                ]
+            }
+
+            save_geometry(
+                connection,
+                record_id,
+                point_geometry
+            )
+
+
+# ============================================================
+# DİNAMİK HARİTA
+# ============================================================
+
+def build_map(connection):
+    """
+    Veritabanındaki konumlanmış tüm aktif kayıtları tek bir
+    HTML haritada gösterir.
+
+    AI_Test.py'deki sabit metinli haritanın aksine, burada
+    veritabanındaki her aktif ve konumu bulunmuş kayıt işlenir.
+    """
+
+    cursor = connection.execute(
+        """
+        SELECT
+            id,
+            guzergah_raw,
+            geocode_result,
+            geometry_type,
+            geometry
+        FROM road_closures
+        WHERE
+            active = 1
+            AND (geocode_result IS NOT NULL OR geometry IS NOT NULL)
+        """
+    )
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        print("\nHaritada gösterilecek konumlanmış aktif kayıt yok.")
+        return
+
+    # İlk bulunan noktayı haritanın merkezi yap
+    first_point = None
+
+    for row in rows:
+
+        geocode_result = row[2]
+
+        if geocode_result:
+            data = json.loads(geocode_result)
+            first_point = (data["latitude"], data["longitude"])
+            break
+
+    if first_point is None:
+        print("\nHarita için merkez nokta bulunamadı.")
+        return
+
+    m = folium.Map(
+        location=list(first_point),
+        zoom_start=13
+    )
+
+    for row in rows:
+
+        record_id, guzergah_raw, geocode_result, geometry_type, geometry = row
+
+        if geocode_result:
+
+            data = json.loads(geocode_result)
+
+            folium.Marker(
+                location=[data["latitude"], data["longitude"]],
+                popup=guzergah_raw
+            ).add_to(m)
+
+        if geometry and geometry_type == "LineString":
+
+            geo = json.loads(geometry)
+
+            coords = [
+                [lat, lon]
+                for lon, lat in geo["coordinates"]
+            ]
+
+            folium.PolyLine(
+                locations=coords,
+                weight=5,
+                popup=guzergah_raw
+            ).add_to(m)
+
+    os.makedirs("output", exist_ok=True)
+
+    m.save(MAP_PATH)
+
+    print(f"\nHarita oluşturuldu: {MAP_PATH}")
+
+
+# ============================================================
 # ANA PROGRAM
 # ============================================================
 
@@ -788,36 +1170,19 @@ def main():
     )
 
     # --------------------------------------------------------
-    # AI
-    # --------------------------------------------------------
-    #
-    # Burada henüz Gemini/OpenAI vb. bağlamıyoruz.
-    #
-    # AI'ya sadece:
-    #
-    #     guzergah_raw
-    #
-    # gönderilecek.
-    #
-    # AI sonucunda örneğin:
-    #
-    # {
-    #     "location_type": "route",
-    #     "query": "Süleyman Demirel Caddesi, Denizli",
-    #     "start_query": "5049 Sokak, Denizli",
-    #     "end_query": "6673 Sokak, Denizli"
-    # }
-    #
-    # dönecek.
-    #
-    # Sonrasında save_ai_result() kullanılacak.
-    #
+    # AI + GEOCODER + GEOMETRY
     # --------------------------------------------------------
 
-    print(
-        "AI katmanı hazır. "
-        "AI sağlayıcısı henüz bağlanmadı."
+    process_pending_ai(
+        connection,
+        pending_records
     )
+
+    # --------------------------------------------------------
+    # HARİTA
+    # --------------------------------------------------------
+
+    build_map(connection)
 
     connection.close()
 

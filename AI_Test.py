@@ -44,8 +44,9 @@ class RoadAnalysis(BaseModel):
 
 # Test edeceğimiz gerçek güzergah metni
 guzergah = """
-Merkezefendi-Yenişehir Şirinköy Caddesi ile Şehit Öğretmen Yusuf Batur Caddesi arasında kalan 75 Sokak üzerinde
+Merkezefendi ilçesi Merkez Efendi Mahallesi Kazım kaynak Caddesi ile KZ/6 Sokak kesişimi ve Kazım kaynak Caddesi ile 1766 sokak kesişimi arasında şerit daraltma çalışması yapılacaktır.
 """
+# Akhan Kavşağı - Pamukkale Bulvarı kesişimi arası denizli istikameti sol şerit kapatılacaktır
 
 
 # Gemini'ye gönderilecek talimat
