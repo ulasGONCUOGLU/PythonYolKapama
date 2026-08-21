@@ -3,7 +3,6 @@ import json
 import os
 import re
 import sqlite3
-import time
 from datetime import date, datetime
 from typing import Optional
 
@@ -11,11 +10,10 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from google import genai
-from pydantic import BaseModel
-from typing import Literal
-
 import folium
+
+from AI_düzenleme import analyze_route
+from konum import konum_bul_ai
 
 
 # ============================================================
@@ -29,54 +27,9 @@ URL = os.getenv("URL")
 if not URL:
     raise ValueError("URL .env dosyasında bulunamadı.")
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY .env dosyasında bulunamadı.")
-
 DB_PATH = "output/yol_kapama.db"
 
 MAP_PATH = "output/road_map.html"
-
-# Nominatim için uygulamayı tanımlayan User-Agent
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-
-USER_AGENT = "YolKapama/1.0 (local development project)"
-
-# Nominatim kamu sunucusunu zorlamamak için
-GEOCODER_DELAY = 1.1
-
-# OSRM
-OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
-
-# Gemini
-GEMINI_MODEL = "gemini-3.6-flash"
-
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
-
-
-# ============================================================
-# AI VERİ MODELİ
-# ============================================================
-
-class RoadAnalysis(BaseModel):
-    location_type: Literal[
-        "road",
-        "road_segment",
-        "intersection",
-        "address",
-        "landmark",
-        "unknown"
-    ]
-
-    road_name: str | None
-    road_query: str | None
-    start_query: str | None
-    end_query: str | None
-
-    confidence: float
 
 
 # ============================================================
@@ -100,6 +53,13 @@ def create_database():
             tarih_raw TEXT NOT NULL,
             kapanma_nedeni_raw TEXT NOT NULL,
 
+            -- Kaynak sitedeki "İLÇE-MAHALLE" hücresi
+            -- (AI tahminine gerek kalmadan, sitenin verdiği
+            -- kesin ilçe/mahalle bilgisi)
+            ilce_mahalle_raw TEXT,
+            ilce TEXT,
+            mahalle TEXT,
+
             -- Python tarafından ayrıştırılan tarih
             start_date TEXT,
             end_date TEXT,
@@ -108,6 +68,8 @@ def create_database():
             -- AI sonucu
             ai_status TEXT NOT NULL DEFAULT 'pending',
             ai_location_type TEXT,
+            ai_neighborhood TEXT,
+            ai_district TEXT,
             ai_query TEXT,
             ai_start_query TEXT,
             ai_end_query TEXT,
@@ -127,6 +89,28 @@ def create_database():
         )
         """
     )
+
+    # --------------------------------------------------------
+    # Eski veritabanlarında ai_neighborhood / ai_district
+    # sütunları olmayabilir (tablo daha önce CREATE TABLE IF
+    # NOT EXISTS ile oluşturulmuş olabilir). Var olan bir
+    # veritabanını bozmadan sütunları sonradan ekliyoruz.
+    # --------------------------------------------------------
+
+    for column_def in (
+        "ai_neighborhood TEXT",
+        "ai_district TEXT",
+        "ilce_mahalle_raw TEXT",
+        "ilce TEXT",
+        "mahalle TEXT"
+    ):
+        try:
+            connection.execute(
+                f"ALTER TABLE road_closures ADD COLUMN {column_def}"
+            )
+        except sqlite3.OperationalError:
+            # Sütun zaten var, sorun değil.
+            pass
 
     connection.commit()
 
@@ -223,6 +207,47 @@ def is_active(start_date: Optional[date], end_date: Optional[date]) -> int:
 
 
 # ============================================================
+# AKTİF DURUMUNU GÜNCELLE
+# ============================================================
+
+def refresh_active_status(connection):
+    """
+    Tüm kayıtların active durumunu BUGÜNÜN tarihine göre yeniden
+    hesaplar.
+
+    save_record() içindeki active değeri sadece kayıt ilk eklenirken
+    hesaplanıyor; zaman geçip end_date'i dolan kayıtlar bu fonksiyon
+    çalıştırılmadan active=1 olarak kalmaya devam eder ve haritada
+    süresi geçmiş yol kapamaları görünmeye devam eder.
+
+    Bu fonksiyon her çalıştırmada (harita oluşturulmadan ve AI/konum
+    kuyrukları çekilmeden ÖNCE) çağrılmalıdır.
+    """
+
+    today = date.today().isoformat()
+    now = datetime.now().isoformat(timespec="seconds")
+
+    connection.execute(
+        """
+        UPDATE road_closures
+        SET
+            active = CASE
+                WHEN start_date IS NOT NULL
+                     AND end_date IS NOT NULL
+                     AND start_date <= ?
+                     AND end_date >= ?
+                THEN 1
+                ELSE 0
+            END,
+            updated_at = ?
+        """,
+        (today, today, now)
+    )
+
+    connection.commit()
+
+
+# ============================================================
 # KAYIT HASH
 # ============================================================
 
@@ -306,12 +331,22 @@ def find_column_indexes(table):
             and "KAPANMA NEDENİ" in values
         ):
 
-            return {
+            indexes = {
                 "guzergah": values.index("GÜZERGAH"),
                 "tarih": values.index("TARİH"),
                 "kapanma_nedeni": values.index("KAPANMA NEDENİ"),
                 "header_row": row
             }
+
+            # İLÇE-MAHALLE sütunu her sitede olmayabilir,
+            # bulunamazsa None bırakıyoruz; extract_records
+            # bu durumu ele alır.
+            if "İLÇE-MAHALLE" in values:
+                indexes["ilce_mahalle"] = values.index("İLÇE-MAHALLE")
+            else:
+                indexes["ilce_mahalle"] = None
+
+            return indexes
 
     raise ValueError(
         "GÜZERGAH, TARİH ve KAPANMA NEDENİ başlıkları bulunamadı."
@@ -324,7 +359,7 @@ def find_column_indexes(table):
 
 def extract_records(table):
     """
-    Target table içerisinden yalnızca istediğimiz üç sütunu çıkarır.
+    Target table içerisinden istediğimiz sütunları çıkarır.
     """
 
     columns = find_column_indexes(table)
@@ -332,6 +367,7 @@ def extract_records(table):
     guzergah_index = columns["guzergah"]
     tarih_index = columns["tarih"]
     neden_index = columns["kapanma_nedeni"]
+    ilce_mahalle_index = columns["ilce_mahalle"]
 
     records = []
 
@@ -343,11 +379,16 @@ def extract_records(table):
         cells = row.find_all("td")
 
         # Veri satırı değilse geç
-        max_index = max(
+        required_indexes = [
             guzergah_index,
             tarih_index,
             neden_index
-        )
+        ]
+
+        if ilce_mahalle_index is not None:
+            required_indexes.append(ilce_mahalle_index)
+
+        max_index = max(required_indexes)
 
         if len(cells) <= max_index:
             continue
@@ -364,6 +405,18 @@ def extract_records(table):
             cells[neden_index].get_text(" ", strip=True)
         )
 
+        ilce_mahalle_raw = None
+        ilce = None
+        mahalle = None
+
+        if ilce_mahalle_index is not None:
+
+            ilce_mahalle_raw = clean_text(
+                cells[ilce_mahalle_index].get_text(" ", strip=True)
+            )
+
+            ilce, mahalle = split_ilce_mahalle(ilce_mahalle_raw)
+
         # Tamamen boş satırları alma
         if not guzergah and not tarih and not kapanma_nedeni:
             continue
@@ -372,11 +425,46 @@ def extract_records(table):
             {
                 "guzergah": guzergah,
                 "tarih": tarih,
-                "kapanma_nedeni": kapanma_nedeni
+                "kapanma_nedeni": kapanma_nedeni,
+                "ilce_mahalle_raw": ilce_mahalle_raw,
+                "ilce": ilce,
+                "mahalle": mahalle
             }
         )
 
     return records
+
+
+# ============================================================
+# İLÇE-MAHALLE HÜCRESİNİ AYRIŞTIR
+# ============================================================
+
+def split_ilce_mahalle(ilce_mahalle_raw: str | None):
+    """
+    Kaynak sitedeki "İLÇE-MAHALLE" hücresini ayrıştırır.
+
+    Örnek:
+        "Pamukkale-Pınarkent"   -> ("Pamukkale", "Pınarkent")
+        "Merkezefendi-Şemikler" -> ("Merkezefendi", "Şemikler")
+
+    Format beklenenden farklıysa (tire yoksa) ilçe olarak
+    tüm metni döner, mahalle None kalır.
+    """
+
+    if not ilce_mahalle_raw:
+        return None, None
+
+    # Sadece ilk tireden ayır; mahalle adının içinde
+    # tire geçme ihtimaline karşı (örn. "Kaklık-Yeni Mahalle"
+    # gibi bir durum olursa mahalle kısmı bozulmasın).
+    parts = ilce_mahalle_raw.split("-", 1)
+
+    if len(parts) == 2:
+        ilce = parts[0].strip()
+        mahalle = parts[1].strip()
+        return ilce or None, mahalle or None
+
+    return ilce_mahalle_raw.strip() or None, None
 
 
 # ============================================================
@@ -394,6 +482,9 @@ def save_record(connection, record):
     guzergah = record["guzergah"]
     tarih = record["tarih"]
     kapanma_nedeni = record["kapanma_nedeni"]
+    ilce_mahalle_raw = record.get("ilce_mahalle_raw")
+    ilce = record.get("ilce")
+    mahalle = record.get("mahalle")
 
     record_hash = create_record_hash(
         guzergah,
@@ -417,19 +508,25 @@ def save_record(connection, record):
             guzergah_raw,
             tarih_raw,
             kapanma_nedeni_raw,
+            ilce_mahalle_raw,
+            ilce,
+            mahalle,
             start_date,
             end_date,
             active,
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record_hash,
             guzergah,
             tarih,
             kapanma_nedeni,
+            ilce_mahalle_raw,
+            ilce,
+            mahalle,
             start_date.isoformat() if start_date else None,
             end_date.isoformat() if end_date else None,
             active,
@@ -456,7 +553,8 @@ def save_ai_result(
     ai_result
 ):
     """
-    AI'nın döndürdüğü sonucu mevcut kayda bağlar.
+    AI_düzenleme.analyze_route()'un döndürdüğü sonucu mevcut
+    kayda bağlar.
 
     AI'nın tarih veya kapanma nedenini değiştirmesine izin verilmez.
     """
@@ -467,6 +565,8 @@ def save_ai_result(
         SET
             ai_status = ?,
             ai_location_type = ?,
+            ai_neighborhood = ?,
+            ai_district = ?,
             ai_query = ?,
             ai_start_query = ?,
             ai_end_query = ?,
@@ -477,6 +577,8 @@ def save_ai_result(
         (
             "success",
             ai_result.get("location_type"),
+            ai_result.get("neighborhood"),
+            ai_result.get("district"),
             ai_result.get("query"),
             ai_result.get("start_query"),
             ai_result.get("end_query"),
@@ -493,62 +595,39 @@ def save_ai_result(
 
 
 # ============================================================
-# NOMINATIM GEOCODER
+# AI SONUCU KAYDEDEMEDİĞİMİZ DURUM
 # ============================================================
 
-def geocode(query: str):
+def save_ai_error(connection, record_id, error_message):
     """
-    Nominatim üzerinden konum arar.
+    AI çağrısı başarısız olduğunda kaydı 'error' olarak işaretler.
 
-    Sonuç:
-        {
-            "latitude": ...,
-            "longitude": ...,
-            ...
-        }
-
+    Böylece bir sonraki çalıştırmada tekrar denenebilir hale
+    getirmek istersen ai_status = 'pending' yapılabilir; şimdilik
+    başarısız denemeleri ayırt etmek için 'error' kullanıyoruz.
     """
 
-    if not query:
-        return None
-
-    headers = {
-        "User-Agent": USER_AGENT
-    }
-
-    params = {
-        "q": query,
-        "format": "jsonv2",
-        "limit": 1,
-        "countrycodes": "tr"
-    }
-
-    response = requests.get(
-        NOMINATIM_URL,
-        params=params,
-        headers=headers,
-        timeout=30
+    connection.execute(
+        """
+        UPDATE road_closures
+        SET
+            ai_status = ?,
+            ai_result = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            "error",
+            json.dumps(
+                {"error": error_message},
+                ensure_ascii=False
+            ),
+            datetime.now().isoformat(timespec="seconds"),
+            record_id
+        )
     )
 
-    response.raise_for_status()
-
-    results = response.json()
-
-    # Nominatim kamu servisini zorlamamak için
-    time.sleep(GEOCODER_DELAY)
-
-    if not results:
-        return None
-
-    result = results[0]
-
-    return {
-        "latitude": float(result["lat"]),
-        "longitude": float(result["lon"]),
-        "display_name": result.get("display_name"),
-        "osm_type": result.get("osm_type"),
-        "osm_id": result.get("osm_id")
-    }
+    connection.commit()
 
 
 # ============================================================
@@ -560,6 +639,11 @@ def save_geocode_result(
     record_id,
     result
 ):
+    """
+    konum.konum_bul_ai()'nin döndürdüğü AdresSonucu'ndan türetilen
+    sade bir sözlüğü (ya da bulunamadıysa None'ı) kaydeder.
+    """
+
     if result is None:
 
         connection.execute(
@@ -605,55 +689,6 @@ def save_geocode_result(
 
 
 # ============================================================
-# OSRM ROUTE GEOMETRY
-# ============================================================
-
-def get_route_geometry(
-    start_lat,
-    start_lon,
-    end_lat,
-    end_lon
-):
-    """
-    İki koordinat arasındaki gerçek yol geometrisini alır.
-
-    OSRM GeoJSON döndürür.
-    """
-
-    coordinates = (
-        f"{start_lon},{start_lat};"
-        f"{end_lon},{end_lat}"
-    )
-
-    url = f"{OSRM_URL}/{coordinates}"
-
-    params = {
-        "overview": "full",
-        "geometries": "geojson"
-    }
-
-    response = requests.get(
-        url,
-        params=params,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if data.get("code") != "Ok":
-        return None
-
-    routes = data.get("routes", [])
-
-    if not routes:
-        return None
-
-    return routes[0]["geometry"]
-
-
-# ============================================================
 # GEOMETRİYİ SQLITE'A YAZ
 # ============================================================
 
@@ -693,16 +728,32 @@ def save_geometry(
 # ============================================================
 
 def get_pending_ai_records(connection):
+    """
+    AI analizi hiç yapılmamış (pending) VEYA daha önce yapılmış ama
+    başarısız/eksik kalmış (error, ya da ai_status='success' olduğu
+    halde ai_location_type/ai_result boş kalmış) aktif kayıtları getirir.
+
+    Böylece sadece yeni eklenen kayıtlar değil, DB'de AI hücresi boş
+    kalmış eski kayıtlar da bir sonraki çalıştırmada tekrar AI'ya
+    gönderilir.
+    """
 
     cursor = connection.execute(
         """
         SELECT
             id,
-            guzergah_raw
+            guzergah_raw,
+            ilce,
+            mahalle
         FROM road_closures
         WHERE
             active = 1
-            AND ai_status = 'pending'
+            AND (
+                ai_status IS NULL
+                OR ai_status != 'success'
+                OR ai_result IS NULL
+                OR ai_location_type IS NULL
+            )
         ORDER BY id
         """
     )
@@ -711,132 +762,132 @@ def get_pending_ai_records(connection):
 
 
 # ============================================================
-# AI SONUCU KAYDEDEMEDİĞİMİZ DURUM
+# KONUMU EKSİK/BAŞARISIZ KAYITLARI GETİR
 # ============================================================
 
-def save_ai_error(connection, record_id, error_message):
+def get_pending_geocode_records(connection):
     """
-    AI çağrısı başarısız olduğunda kaydı 'error' olarak işaretler.
+    AI analizi başarıyla tamamlanmış (dolayısıyla road_query/start_query/
+    end_query gibi bilgiler elde) ama konum/koordinat hâlâ bulunamamış
+    veya geometry alanı boş kalmış aktif kayıtları getirir.
 
-    Böylece bir sonraki çalıştırmada tekrar denenebilir hale
-    getirmek istersen ai_status = 'pending' yapılabilir; şimdilik
-    başarısız denemeleri ayırt etmek için 'error' kullanıyoruz.
+    Bu kayıtlar için AI tekrar çağrılmaz; sadece daha önce kaydedilmiş
+    ai_result JSON'ı kullanılarak konum.py yeniden denenir.
     """
 
-    connection.execute(
+    cursor = connection.execute(
         """
-        UPDATE road_closures
-        SET
-            ai_status = ?,
-            ai_result = ?,
-            updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            "error",
-            json.dumps(
-                {"error": error_message},
-                ensure_ascii=False
-            ),
-            datetime.now().isoformat(timespec="seconds"),
-            record_id
-        )
+        SELECT
+            id,
+            guzergah_raw,
+            ilce,
+            mahalle,
+            ai_result
+        FROM road_closures
+        WHERE
+            active = 1
+            AND ai_status = 'success'
+            AND ai_result IS NOT NULL
+            AND (
+                geocode_status IS NULL
+                OR geocode_status != 'success'
+                OR geocode_result IS NULL
+                OR geometry IS NULL
+            )
+        ORDER BY id
+        """
     )
 
-    connection.commit()
+    return cursor.fetchall()
 
 
 # ============================================================
-# AI PROMPT
+# KONUM BULMA (TEK KAYIT İÇİN - ORTAK ADIM)
 # ============================================================
 
-def build_ai_prompt(guzergah_raw: str) -> str:
-
-    return f"""
-Sen Denizli'deki belediyelerin yol kapatma
-duyurularını analiz eden bir konum analiz sistemisin.
-
-Görevin, verilen güzergah metnini analiz ederek geocoding
-işlemi için kullanılabilecek konum bilgilerini çıkarmaktır.
-
-Kurallar:
-
-1. Asla koordinat üretme.
-2. Asla koordinat tahmin etme.
-3. Metinde bulunmayan bir yol veya adresi gerçekmiş gibi
-   uydurma.
-4. Yolun tamamı belirtiliyorsa location_type = "road" kullan.
-5. Bir yolun başka iki nokta arasındaki bölümü belirtiliyorsa
-   location_type = "road_segment" kullan.
-6. İki yolun kesiştiği belirtiliyorsa
-   location_type = "intersection" kullan.
-7. Açık bir adres belirtiliyorsa location_type = "address" kullan.
-8. Bir bina, tesis veya bilinen nokta belirtiliyorsa
-   location_type = "landmark" kullan.
-9. Emin olmadığın durumda location_type = "unknown" kullan.
-10. Geocoder için kullanılabilecek sorguları oluştur.
-11. confidence değerini 0 ile 1 arasında ver.
-12. Metinde olmayan bilgileri uydurmak yerine ilgili alanı null bırak.
-
-Güzergah metni:
-
-{guzergah_raw}
-"""
-
-
-# ============================================================
-# AI ÇAĞRISI
-# ============================================================
-
-def analyze_route_with_ai(guzergah_raw: str):
+def _process_konum_for_record(
+    connection,
+    record_id,
+    ai_result,
+    web_mahalle,
+    web_ilce
+):
     """
-    Gemini'ye güzergah metnini gönderir, RoadAnalysis olarak
-    parse edilmiş sonucu döndürür.
+    Elde zaten bir ai_result varken (ister AI'dan yeni gelmiş, ister
+    daha önce DB'ye kaydedilmiş) konum.konum_bul_ai() çağırıp sonucu
+    kaydeden ortak adım.
 
-    Hata durumunda None döner.
+    Kaynak sitedeki İLÇE-MAHALLE hücresi AI'nin metinden tahmin
+    ettiğinden çok daha güvenilir (kesin veri), bu yüzden
+    web_mahalle/web_ilce konum.py'ye ayrıca gönderilir ve orada AI
+    tahminine göre önceliklendirilir.
     """
 
-    prompt = build_ai_prompt(guzergah_raw)
+    effective_neighborhood = web_mahalle or ai_result.get("neighborhood")
+    effective_district = web_ilce or ai_result.get("district")
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": RoadAnalysis,
-            },
-        )
+    print(f"AI konum tipi : {ai_result.get('location_type')}")
+    print(f"Mahalle       : {effective_neighborhood} (AI: {ai_result.get('neighborhood')}, Web: {web_mahalle})")
+    print(f"İlçe          : {effective_district} (AI: {ai_result.get('district')}, Web: {web_ilce})")
+    print(f"Confidence    : {ai_result.get('confidence')}")
 
-        return response.parsed
+    konum_sonucu = konum_bul_ai(
+        ai_result,
+        web_mahalle=web_mahalle,
+        web_ilce=web_ilce,
+    )
 
-    except Exception as e:
-        print("AI çağrısı hatası:")
-        print(type(e).__name__)
-        print(e)
+    if konum_sonucu is None:
+        print("Konum bulunamadı.")
+        save_geocode_result(connection, record_id, None)
+        return
 
-        return None
+    print(f"Konum bulundu ({konum_sonucu.kaynak}): {konum_sonucu.gosterim_adi}")
+
+    if not konum_sonucu.tam_eslesme:
+        print(f"UYARI: Yaklaşık/şüpheli eşleşme - {konum_sonucu.uyari}")
+
+    save_geocode_result(
+        connection,
+        record_id,
+        {
+            "latitude": konum_sonucu.lat,
+            "longitude": konum_sonucu.lon,
+            "display_name": konum_sonucu.gosterim_adi,
+            "tam_eslesme": konum_sonucu.tam_eslesme,
+            "uyari": konum_sonucu.uyari,
+            "kaynak": konum_sonucu.kaynak,
+        }
+    )
+
+    if konum_sonucu.geojson:
+        save_geometry(connection, record_id, konum_sonucu.geojson)
+    else:
+        point_geometry = {
+            "type": "Point",
+            "coordinates": [konum_sonucu.lon, konum_sonucu.lat],
+        }
+        save_geometry(connection, record_id, point_geometry)
 
 
 # ============================================================
-# AI + GEOCODER + GEOMETRY (BEKLEYEN KAYITLARI İŞLE)
+# AI + KONUM (BEKLEYEN/EKSİK KAYITLARI İŞLE)
 # ============================================================
 
 def process_pending_ai(connection, pending_records):
     """
-    Her bekleyen kayıt için:
+    Her bekleyen/eksik kayıt için:
 
-    1. Gemini ile güzergah metnini analiz eder.
-    2. Sonucu SQLite'a yazar.
-    3. Sırasıyla road_query / start_query / end_query ile
-       geocode dener, ilk başarılı sonucu ana konum olarak kaydeder.
-    4. start_query ve end_query ikisi de bulunursa OSRM ile
-       rota geometrisini alır ve kaydeder.
-    5. Sadece tek nokta bulunduysa geometry alanına Point olarak yazar.
+    1. AI_düzenleme.analyze_route() ile güzergah metnini analiz ettirir
+       ve sonucu (ai_result dict) SQLite'a yazar.
+    2. _process_konum_for_record() ile konum.py'yi çağırıp sonucu kaydeder.
+
+    main.py; Gemini, Nominatim veya OSRM detaylarını bilmez, sadece
+    iki modülün döndürdüğü sonuçları SQLite'a yazar.
     """
 
     if not pending_records:
-        print("AI analizi bekleyen kayıt yok.")
+        print("AI analizi bekleyen/eksik kayıt yok.")
         return
 
     print(f"\n{len(pending_records)} kayıt için AI analizi başlıyor...")
@@ -845,12 +896,21 @@ def process_pending_ai(connection, pending_records):
 
         record_id = row[0]
         guzergah_raw = row[1]
+        web_ilce = row[2]
+        web_mahalle = row[3]
 
         print(f"\n[{record_id}] {guzergah_raw}")
 
-        analysis = analyze_route_with_ai(guzergah_raw)
+        if web_ilce or web_mahalle:
+            print(f"Kaynak ilçe/mahalle: {web_ilce} / {web_mahalle}")
 
-        if analysis is None:
+        # --------------------------------------------------
+        # 1) AI ANALİZİ (AI_düzenleme.py'den)
+        # --------------------------------------------------
+
+        ai_result = analyze_route(guzergah_raw)
+
+        if ai_result is None:
             print("AI analizi başarısız, kayıt atlanıyor.")
 
             save_ai_error(
@@ -861,103 +921,66 @@ def process_pending_ai(connection, pending_records):
 
             continue
 
-        ai_result = {
-            "location_type": analysis.location_type,
-            "road_name": analysis.road_name,
-            "query": analysis.road_query,
-            "start_query": analysis.start_query,
-            "end_query": analysis.end_query,
-            "confidence": analysis.confidence
-        }
-
         save_ai_result(
             connection,
             record_id,
             ai_result
         )
 
-        print(f"AI konum tipi : {analysis.location_type}")
-        print(f"Confidence    : {analysis.confidence}")
-
         # --------------------------------------------------
-        # GEOCODING (öncelik: road_query -> start_query -> end_query)
+        # 2) KONUM BULMA (konum.py'den)
         # --------------------------------------------------
 
-        location_result = None
-
-        for candidate in (
-            analysis.road_query,
-            analysis.start_query,
-            analysis.end_query
-        ):
-            if not candidate:
-                continue
-
-            location_result = geocode(candidate)
-
-            if location_result:
-                break
-
-        save_geocode_result(
+        _process_konum_for_record(
             connection,
             record_id,
-            location_result
+            ai_result,
+            web_mahalle,
+            web_ilce
         )
 
-        if location_result:
-            print(f"Geocode bulundu: {location_result['display_name']}")
-        else:
-            print("Geocode bulunamadı.")
 
-        # --------------------------------------------------
-        # ROTA GEOMETRİSİ
-        # --------------------------------------------------
+# ============================================================
+# SADECE KONUM (AI ZATEN BAŞARILI AMA KOORDİNAT/GEOMETRİ EKSİK)
+# ============================================================
 
-        start_location = (
-            geocode(analysis.start_query)
-            if analysis.start_query else None
+def process_pending_geocode(connection, pending_records):
+    """
+    AI analizi daha önce başarıyla tamamlanmış ama konum/koordinat
+    hâlâ bulunamamış (ya da geometry alanı boş kalmış) kayıtları,
+    AI'yı TEKRAR ÇAĞIRMADAN, DB'deki kayıtlı ai_result JSON'ını
+    kullanarak sadece konum.py üzerinden yeniden dener.
+
+    Böylece Nominatim/OSRM geçici olarak cevap vermediği ya da eski
+    kayıtlarda koordinat hiç bulunamamışsa, gereksiz yere AI'yı tekrar
+    çağırmadan sadece eksik kalan koordinat/geometri tamamlanır.
+    """
+
+    if not pending_records:
+        print("Konumu eksik/başarısız kayıt yok.")
+        return
+
+    print(f"\n{len(pending_records)} kayıt için konum yeniden deneniyor...")
+
+    for row in pending_records:
+
+        record_id, guzergah_raw, web_ilce, web_mahalle, ai_result_raw = row
+
+        print(f"\n[{record_id}] {guzergah_raw}")
+
+        try:
+            ai_result = json.loads(ai_result_raw)
+        except (TypeError, ValueError):
+            print("Kayıtlı AI sonucu okunamadı (bozuk JSON), atlanıyor.")
+            continue
+
+        _process_konum_for_record(
+            connection,
+            record_id,
+            ai_result,
+            web_mahalle,
+            web_ilce
         )
-
-        end_location = (
-            geocode(analysis.end_query)
-            if analysis.end_query else None
-        )
-
-        if start_location and end_location:
-
-            geometry = get_route_geometry(
-                start_location["latitude"],
-                start_location["longitude"],
-                end_location["latitude"],
-                end_location["longitude"]
-            )
-
-            if geometry:
-                save_geometry(
-                    connection,
-                    record_id,
-                    geometry
-                )
-
-                print("Rota geometrisi kaydedildi.")
-            else:
-                print("OSRM rota bulamadı.")
-
-        elif location_result:
-
-            point_geometry = {
-                "type": "Point",
-                "coordinates": [
-                    location_result["longitude"],
-                    location_result["latitude"]
-                ]
-            }
-
-            save_geometry(
-                connection,
-                record_id,
-                point_geometry
-            )
 
 
 # ============================================================
@@ -969,9 +992,15 @@ def build_map(connection):
     Veritabanındaki konumlanmış tüm aktif kayıtları tek bir
     HTML haritada gösterir.
 
-    AI_Test.py'deki sabit metinli haritanın aksine, burada
-    veritabanındaki her aktif ve konumu bulunmuş kayıt işlenir.
+    Her çalıştırmada önce eski harita dosyası silinir, sonra SADECE
+    o an (bugünün tarihine göre, bkz. refresh_active_status) aktif
+    olan kayıtlarla yeniden oluşturulur. Böylece tarihi geçmiş yol
+    kapamaları haritada asılı kalmaz.
     """
+
+    if os.path.exists(MAP_PATH):
+        os.remove(MAP_PATH)
+        print(f"\nEski harita silindi: {MAP_PATH}")
 
     cursor = connection.execute(
         """
@@ -1139,6 +1168,16 @@ def main():
     )
 
     # --------------------------------------------------------
+    # AKTİF DURUMUNU BUGÜNE GÖRE YENİDEN HESAPLA
+    #
+    # Sadece yeni eklenen kayıtlar değil, süresi dolmuş eski
+    # kayıtlar da burada active=0'a çekilir; böylece AI/konum
+    # kuyrukları ve harita her zaman bugüne göre doğru olur.
+    # --------------------------------------------------------
+
+    refresh_active_status(connection)
+
+    # --------------------------------------------------------
     # Aktif kayıtlar
     # --------------------------------------------------------
 
@@ -1158,6 +1197,9 @@ def main():
 
     # --------------------------------------------------------
     # AI'YA GİDECEK KAYITLAR
+    #
+    # Sadece yeni eklenen (pending) değil, DB'de AI hücresi boş
+    # kalmış veya daha önce hata almış aktif kayıtlar da dahildir.
     # --------------------------------------------------------
 
     pending_records = get_pending_ai_records(
@@ -1165,17 +1207,39 @@ def main():
     )
 
     print(
-        f"AI analizi bekleyen aktif kayıt: "
+        f"AI analizi bekleyen/eksik aktif kayıt: "
         f"{len(pending_records)}"
     )
 
     # --------------------------------------------------------
-    # AI + GEOCODER + GEOMETRY
+    # AI + KONUM (AI_düzenleme.py ve konum.py üzerinden)
     # --------------------------------------------------------
 
     process_pending_ai(
         connection,
         pending_records
+    )
+
+    # --------------------------------------------------------
+    # SADECE KONUMU EKSİK KALAN KAYITLAR
+    #
+    # AI'sı başarılı ama koordinat/geometri hâlâ boş kalmış (Nominatim/
+    # OSRM o an cevap vermemiş, ya da eski kayıtlarda hiç bulunamamış)
+    # kayıtlar; AI tekrar çağrılmadan sadece konum.py ile denenir.
+    # --------------------------------------------------------
+
+    pending_geocode_records = get_pending_geocode_records(
+        connection
+    )
+
+    print(
+        f"Konumu eksik/başarısız aktif kayıt: "
+        f"{len(pending_geocode_records)}"
+    )
+
+    process_pending_geocode(
+        connection,
+        pending_geocode_records
     )
 
     # --------------------------------------------------------
