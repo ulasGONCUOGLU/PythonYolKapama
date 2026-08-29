@@ -5,6 +5,15 @@ AI_düzenleme.py
 Güzergah metnini (ör. "75 Sokak") yapay zeka (Gemini) ile analiz edip,
 konum.py'nin (geocoder) kullanabileceği sorgu bileşenlerine ayıran modül.
 
+DEĞİŞİKLİK (Supabase entegrasyonu):
+Prompt'un giriş cümlesi ("Sen Denizli'deki belediyelerin...") artık
+kod içinde sabit değil, Supabase'teki settings tablosundan okunuyor.
+Nuxt'taki Ayarlar sayfasında bu metin değiştirilip kaydedilince, bir
+sonraki pipeline çalıştırmasında AI otomatik olarak yeni talimatı
+kullanır. Aşağıdaki numaralı kurallar ise pipeline'ın doğru çalışması
+için kritik olduğundan kasıtlı olarak sabit tutulmuştur (kullanıcının
+yanlışlıkla bozmaması için) — sadece giriş cümlesi/bağlamı değişebilir.
+
 main.py bu modülden SADECE `analyze_route(guzergah_raw)` fonksiyonunu
 çağırır ve karşılığında aşağıdaki gibi bir sözlük (dict) alır — ya da
 hata durumunda None:
@@ -20,9 +29,6 @@ hata durumunda None:
         "end_query": str | None,
         "confidence": float,
     }
-
-Gemini çağrısı, prompt oluşturma ve pydantic şeması tamamen bu dosyada
-tutulur; main.py bunların hiçbirini bilmek zorunda değildir.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from google import genai
 from pydantic import BaseModel
+
+import db_supabase as db
 
 # ============================================================
 # AYARLAR
@@ -47,8 +55,13 @@ if not GEMINI_API_KEY:
 
 GEMINI_MODEL = "gemini-3.6-flash"
 
-gemini_client = genai.Client(
-    api_key=GEMINI_API_KEY
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Supabase'teki settings tablosunda "system_prompt" hiç ayarlanmamışsa
+# (örn. ilk kurulumda) kullanılacak yedek metin.
+DEFAULT_SYSTEM_PROMPT = (
+    "Sen Denizli'deki belediyelerin yol kapatma duyurularını analiz eden "
+    "bir konum analiz sistemisin."
 )
 
 
@@ -58,20 +71,11 @@ gemini_client = genai.Client(
 
 class RoadAnalysis(BaseModel):
     location_type: Literal[
-        "road",
-        "road_segment",
-        "intersection",
-        "address",
-        "landmark",
-        "unknown"
+        "road", "road_segment", "intersection", "address", "landmark", "unknown"
     ]
 
     road_name: str | None
 
-    # Adres bağlamı: mahalle ve ilçe
-    # Geocoder'a HER zaman bu bilgilerle birlikte gidilecek,
-    # aksi halde aynı isimli sokak/cadde başka bir mahallede
-    # bulunabiliyor (örn. Denizli'de birden fazla "5049 Sokak").
     neighborhood: str | None
     district: str | None
 
@@ -88,9 +92,10 @@ class RoadAnalysis(BaseModel):
 
 def build_ai_prompt(guzergah_raw: str) -> str:
 
+    system_prompt = db.get_setting("system_prompt", DEFAULT_SYSTEM_PROMPT)
+
     return f"""
-Sen Denizli'deki belediyelerin yol kapatma
-duyurularını analiz eden bir konum analiz sistemisin.
+{system_prompt}
 
 Görevin, verilen güzergah metnini analiz ederek geocoding
 işlemi için kullanılabilecek konum bilgilerini çıkarmaktır.
@@ -140,9 +145,7 @@ Güzergah metni:
 def _analyze_route_with_ai(guzergah_raw: str) -> Optional[RoadAnalysis]:
     """
     Gemini'ye güzergah metnini gönderir, RoadAnalysis olarak
-    parse edilmiş sonucu döndürür.
-
-    Hata durumunda None döner.
+    parse edilmiş sonucu döndürür. Hata durumunda None döner.
     """
 
     prompt = build_ai_prompt(guzergah_raw)
