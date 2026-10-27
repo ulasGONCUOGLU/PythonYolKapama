@@ -37,6 +37,7 @@ worker'lar arasında paylaşılmaz — bu yüzden bu servisi TEK worker ile
 
 from __future__ import annotations
 
+import hmac
 import os
 import threading
 from datetime import datetime
@@ -98,9 +99,12 @@ def _arka_planda_calistir(run_id: int) -> None:
 def run():
     global _calisiyor_mu
 
-    token = request.headers.get("X-Internal-Token")
+    token = request.headers.get("X-Internal-Token") or ""
 
-    if token != INTERNAL_API_TOKEN:
+    # Sabit sürede karşılaştırma (zamanlama saldırılarına karşı).
+    if not hmac.compare_digest(
+        token.encode("utf-8"), INTERNAL_API_TOKEN.encode("utf-8")
+    ):
         return jsonify({"error": "Yetkisiz."}), 401
 
     with _calisma_kilidi:
@@ -108,25 +112,37 @@ def run():
             return jsonify({"error": "Pipeline zaten çalışıyor."}), 409
         _calisiyor_mu = True
 
-    run_row = (
-        db.supabase.table("sync_runs")
-        .insert(
-            {
-                "durum": "calisiyor",
-                "baslangic": datetime.now().isoformat(),
-            }
+    # Kilit alındıktan sonra thread başlamadan bir hata olursa (ör. Supabase'e
+    # ulaşılamadı) kilit serbest bırakılmalı; yoksa servis yeniden başlatılana
+    # kadar her istek "zaten çalışıyor" (409) döner.
+    try:
+        run_row = (
+            db.supabase.table("sync_runs")
+            .insert(
+                {
+                    "durum": "calisiyor",
+                    "baslangic": datetime.now().isoformat(),
+                }
+            )
+            .execute()
         )
-        .execute()
-    )
 
-    run_id = run_row.data[0]["id"]
+        run_id = run_row.data[0]["id"]
 
-    thread = threading.Thread(
-        target=_arka_planda_calistir,
-        args=(run_id,),
-        daemon=True,
-    )
-    thread.start()
+        thread = threading.Thread(
+            target=_arka_planda_calistir,
+            args=(run_id,),
+            daemon=True,
+        )
+        thread.start()
+
+    except Exception as e:
+        with _calisma_kilidi:
+            _calisiyor_mu = False
+
+        print(f"Çalıştırma başlatılamadı: {e}")
+
+        return jsonify({"error": "Çalıştırma başlatılamadı (veritabanına ulaşılamadı)."}), 503
 
     return jsonify({"status": "started", "run_id": run_id}), 202
 
@@ -137,4 +153,10 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    # Werkzeug hata ayıklayıcısı (debug=True) sunucuda kod çalıştırmaya izin
+    # verir; varsayılan olarak kapalıdır. Geliştirirken: FLASK_DEBUG=1 python app.py
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=os.getenv("FLASK_DEBUG", "").strip().lower() in ("1", "true", "yes"),
+    )

@@ -19,15 +19,28 @@ main.py bu modülden SADECE `analyze_route(guzergah_raw)` fonksiyonunu
 hata durumunda None:
 
     {
-        "location_type": "road" | "road_segment" | "intersection" |
-                          "address" | "landmark" | "unknown",
-        "road_name": str | None,
+        # --- Parça listesi (YENİ): duyuruda birden fazla yol/sokak
+        #     parçası varsa her biri ayrı bir öğedir.
+        "segments": [
+            {
+                "location_type": "road" | "road_segment" | "intersection" |
+                                  "address" | "landmark" | "unknown",
+                "road_name": str | None,
+                "query": str | None,          # yol/sokak adı
+                "start_query": str | None,    # parçanın başlangıç sınırı
+                "end_query": str | None,      # parçanın bitiş sınırı
+                "includes_connecting_streets": bool,
+            },
+            ...
+        ],
         "neighborhood": str | None,
         "district": str | None,
-        "query": str | None,        # road_query
-        "start_query": str | None,
-        "end_query": str | None,
         "confidence": float,
+
+        # --- Eski alanlar (geriye uyumluluk): ilk parçadan türetilir.
+        #     Eski kayıtlar ve web arayüzü bunları kullanmaya devam eder.
+        "location_type": ..., "road_name": ..., "query": ...,
+        "start_query": ..., "end_query": ...,
     }
 """
 
@@ -53,7 +66,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY .env dosyasında bulunamadı.")
 
-GEMINI_MODEL = "gemini-3.6-flash"
+# Model .env'den değiştirilebilir (GEMINI_MODEL); API anahtarı aynı kalır.
+# Güncel model ID'leri ve kapatma (shutdown) tarihleri:
+#   https://ai.google.dev/gemini-api/docs/models
+#   https://ai.google.dev/gemini-api/docs/deprecations
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.6-flash"
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -69,19 +86,35 @@ DEFAULT_SYSTEM_PROMPT = (
 # AI VERİ MODELİ
 # ============================================================
 
-class RoadAnalysis(BaseModel):
-    location_type: Literal[
-        "road", "road_segment", "intersection", "address", "landmark", "unknown"
-    ]
+LocationType = Literal[
+    "road", "road_segment", "intersection", "address", "landmark", "unknown"
+]
+
+# Bir duyurudan en fazla bu kadar parça işlenir (Nominatim hız sınırı ve
+# maliyet için üst sınır; fazlası sessizce kesilir).
+MAX_SEGMENTS = 12
+
+
+class RouteSegment(BaseModel):
+    """Duyurudaki TEK bir yol/sokak parçası."""
+
+    location_type: LocationType
 
     road_name: str | None
-
-    neighborhood: str | None
-    district: str | None
 
     road_query: str | None
     start_query: str | None
     end_query: str | None
+
+    # Metinde "... bağlanan sokaklar" gibi bir ifade bu parçayı kapsıyorsa True.
+    includes_connecting_streets: bool
+
+
+class RoadAnalysis(BaseModel):
+    neighborhood: str | None
+    district: str | None
+
+    segments: list[RouteSegment]
 
     confidence: float
 
@@ -106,30 +139,51 @@ Kurallar:
 2. Asla koordinat tahmin etme.
 3. Metinde bulunmayan bir yol veya adresi gerçekmiş gibi
    uydurma.
-4. Yolun tamamı belirtiliyorsa location_type = "road" kullan.
-5. Bir yolun başka iki nokta arasındaki bölümü belirtiliyorsa
-   location_type = "road_segment" kullan.
-6. İki yolun kesiştiği belirtiliyorsa
-   location_type = "intersection" kullan.
-7. Açık bir adres belirtiliyorsa location_type = "address" kullan.
-8. Bir bina, tesis veya bilinen nokta belirtiliyorsa
-   location_type = "landmark" kullan.
-9. Emin olmadığın durumda location_type = "unknown" kullan.
-10. Geocoder için kullanılabilecek sorguları oluştur.
-11. confidence değerini 0 ile 1 arasında ver.
-12. Metinde olmayan bilgileri uydurmak yerine ilgili alanı null bırak.
-13. Metinde bir mahalle adı geçiyorsa (örn. "Yenişehir Mahallesi",
+4. Güzergah metni BİR VEYA BİRDEN FAZLA yol/sokak parçası
+   içerebilir. Metindeki her ayrı parça için segments listesine
+   AYRI bir öğe ekle. Hiçbir parçayı atlama, birbirine karıştırma
+   ya da tek öğede birleştirme. En fazla {MAX_SEGMENTS} öğe.
+5. Her öğenin location_type değeri:
+   - Yolun tamamı belirtiliyorsa "road".
+   - Bir yolun iki nokta (kesişen sokak/cadde) arasındaki bölümü
+     belirtiliyorsa "road_segment".
+   - İki yolun kesiştiği nokta belirtiliyorsa "intersection".
+   - Açık bir adres ise "address".
+   - Bir bina, tesis veya bilinen nokta ise "landmark".
+   - Emin değilsen "unknown".
+6. road_query: parçanın yol/cadde/sokak adı. start_query ve
+   end_query: parçanın başlangıç ve bitişini belirleyen kesişen
+   sokak/cadde adları.
+   Örnek: "A Caddesi'nin B Sokak ile C Sokak arasında kalan kısmı"
+   -> location_type="road_segment", road_query="A Caddesi",
+   start_query="B Sokak", end_query="C Sokak".
+7. Yol adlarını şu biçimde yaz:
+   - Rakamlı sokaklarda "3131 Sokak" biçimini kullan; nokta
+     ("3131. Sokak"), kısaltma ("Sk.", "Sok.") ve çekim eki
+     ("Sokağın", "Sokağa", "Sokağı") KULLANMA.
+   - Tamlama ve çekim eklerini kaldır:
+     "Hüseyin Çokal Caddesi’ nin" -> "Hüseyin Çokal Caddesi".
+   - Adı metinde yazıldığı gibi koru; düzeltme, çeviri veya
+     tahmin yapma.
+8. Metinde "... bağlanan sokaklar" gibi bir ifade geçiyorsa, bu
+   ifadeyle anılan her parçanın (hem ana yol hem de metinde adı
+   sayılan bağlanan sokaklar) includes_connecting_streets değerini
+   true yap. Bağlanan sokaklar için kendin yeni sokak adı UYDURMA;
+   sadece metinde adı geçenleri parça yap. İfade yoksa false.
+9. confidence değerini 0 ile 1 arasında ver (tüm analiz için tek değer).
+10. Metinde olmayan bilgileri uydurmak yerine ilgili alanı null bırak.
+11. Metinde bir mahalle adı geçiyorsa (örn. "Yenişehir Mahallesi",
     "Şirinköy Mahallesi") bunu neighborhood alanına yaz.
     "Mahallesi" / "Mah." gibi ekleri kaldırıp sadece mahalle
     adını yaz (örn. "Yenişehir").
-14. Metinde bir ilçe adı geçiyorsa (örn. "Merkezefendi",
+12. Metinde bir ilçe adı geçiyorsa (örn. "Merkezefendi",
     "Pamukkale", "Honaz") bunu district alanına yaz.
-15. road_query, start_query ve end_query alanlarına SADECE
-    yol/cadde/sokak adını yaz (örn. "75 Sokak"). Mahalle ve
-    ilçe bilgisini bu alanlara ekleme; onlar ayrı ayrı
-    neighborhood ve district alanlarına yazılacak ve geocoder
-    sorgusu program tarafından birleştirilecek.
-16. Mahalle veya ilçe metinde hiç geçmiyorsa neighborhood veya
+13. road_query, start_query ve end_query alanlarına SADECE
+    yol/cadde/sokak adını yaz. Mahalle ve ilçe bilgisini bu
+    alanlara ekleme; onlar ayrı ayrı neighborhood ve district
+    alanlarına yazılacak ve geocoder sorgusu program tarafından
+    birleştirilecek.
+14. Mahalle veya ilçe metinde hiç geçmiyorsa neighborhood veya
     district alanını null bırak, tahmin etme.
 
 Güzergah metni:
@@ -188,13 +242,30 @@ def analyze_route(guzergah_raw: str) -> Optional[dict]:
     if analysis is None:
         return None
 
+    segments = [
+        {
+            "location_type": seg.location_type,
+            "road_name": seg.road_name,
+            "query": seg.road_query,
+            "start_query": seg.start_query,
+            "end_query": seg.end_query,
+            "includes_connecting_streets": bool(seg.includes_connecting_streets),
+        }
+        for seg in (analysis.segments or [])[:MAX_SEGMENTS]
+    ]
+
+    # Eski alanlar ilk parçadan türetilir (geriye uyumluluk: eski kayıtlar,
+    # tablo ekranı ve db_supabase.save_ai_result bunları okur).
+    ilk = segments[0] if segments else {}
+
     return {
-        "location_type": analysis.location_type,
-        "road_name": analysis.road_name,
+        "segments": segments,
         "neighborhood": analysis.neighborhood,
         "district": analysis.district,
-        "query": analysis.road_query,
-        "start_query": analysis.start_query,
-        "end_query": analysis.end_query,
         "confidence": analysis.confidence,
+        "location_type": ilk.get("location_type", "unknown"),
+        "road_name": ilk.get("road_name"),
+        "query": ilk.get("query"),
+        "start_query": ilk.get("start_query"),
+        "end_query": ilk.get("end_query"),
     }

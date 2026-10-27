@@ -29,10 +29,12 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import db_supabase as db
 from AI_düzenleme import analyze_route
-from konum import konum_bul_ai
+from konum import konum_bul_parcalar
 
 # ============================================================
 # AYARLAR
@@ -44,6 +46,40 @@ URL = os.getenv("URL")
 
 if not URL:
     raise ValueError("URL .env dosyasında bulunamadı.")
+
+# Kaynak siteye giden isteklerde botu tanıtan bir User-Agent kullanılır.
+# İletişim bilgisi eklemek için SOURCE_USER_AGENT'ı .env'de değiştirin.
+SOURCE_USER_AGENT = (
+    os.getenv("SOURCE_USER_AGENT", "").strip()
+    or "YolKapamaBot/1.0 (belediye yol kapama duyuru takibi)"
+)
+
+
+def build_http_session() -> requests.Session:
+    """
+    Kaynak siteyi çekmek için oturum oluşturur.
+
+    - Geçici hatalarda (429/5xx, bağlantı kopması) 3 kez, artan bekleme ile
+      yeniden dener; sunucu Retry-After gönderirse ona uyar.
+    - Botu tanıtan User-Agent gönderir.
+    """
+
+    retry = Retry(
+        total=3,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        respect_retry_after_header=True,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry)
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": SOURCE_USER_AGENT})
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
 
 
 # ============================================================
@@ -129,6 +165,16 @@ def create_record_hash(guzergah: str, tarih: str, kapanma_nedeni: str) -> str:
 # HTML TABLOSUNU BUL
 # ============================================================
 
+def baslik_norm(text: str) -> str:
+    """Başlık karşılaştırması için: Türkçe harfleri ASCII'ye indirip büyütür.
+
+    Python'da "Tarih".upper() == "TARIH" (noktasız I) olur ve "TARİH" ile
+    eşleşmez; bu yüzden iki tarafı da aynı biçime getiriyoruz.
+    """
+    tablo = str.maketrans("İıŞşĞğÜüÖöÇç", "IISSGGUUOOCC")
+    return " ".join(clean_text(text).translate(tablo).upper().split())
+
+
 def find_target_table(soup: BeautifulSoup):
     """GÜZERGAH, TARİH ve KAPANMA NEDENİ başlıklarını içeren tabloyu bulur."""
 
@@ -137,14 +183,14 @@ def find_target_table(soup: BeautifulSoup):
         cells = table.find_all(["th", "td"])
 
         headers = [
-            clean_text(cell.get_text(" ", strip=True)).upper()
+            baslik_norm(cell.get_text(" ", strip=True))
             for cell in cells
         ]
 
         if (
-            "GÜZERGAH" in headers
-            and "TARİH" in headers
-            and "KAPANMA NEDENİ" in headers
+            "GUZERGAH" in headers
+            and "TARIH" in headers
+            and "KAPANMA NEDENI" in headers
         ):
             return table
 
@@ -171,25 +217,25 @@ def find_column_indexes(table):
         cells = row.find_all(["th", "td"])
 
         values = [
-            clean_text(cell.get_text(" ", strip=True)).upper()
+            baslik_norm(cell.get_text(" ", strip=True))
             for cell in cells
         ]
 
         if (
-            "GÜZERGAH" in values
-            and "TARİH" in values
-            and "KAPANMA NEDENİ" in values
+            "GUZERGAH" in values
+            and "TARIH" in values
+            and "KAPANMA NEDENI" in values
         ):
 
             indexes = {
-                "guzergah": values.index("GÜZERGAH"),
-                "tarih": values.index("TARİH"),
-                "kapanma_nedeni": values.index("KAPANMA NEDENİ"),
+                "guzergah": values.index("GUZERGAH"),
+                "tarih": values.index("TARIH"),
+                "kapanma_nedeni": values.index("KAPANMA NEDENI"),
                 "header_row": row,
             }
 
-            if "İLÇE-MAHALLE" in values:
-                indexes["ilce_mahalle"] = values.index("İLÇE-MAHALLE")
+            if "ILCE-MAHALLE" in values:
+                indexes["ilce_mahalle"] = values.index("ILCE-MAHALLE")
             else:
                 indexes["ilce_mahalle"] = None
 
@@ -299,7 +345,7 @@ def _process_konum_for_record(
     web_ilce,
 ):
     """
-    Elde zaten bir ai_result varken konum.konum_bul_ai() çağırıp
+    Elde zaten bir ai_result varken konum.konum_bul_parcalar() ile her parçayı konumlandırıp
     sonucu Supabase'e kaydeden ortak adım.
     """
 
@@ -317,42 +363,31 @@ def _process_konum_for_record(
     )
     print(f"Confidence    : {ai_result.get('confidence')}")
 
-    konum_sonucu = konum_bul_ai(
+    sonuc = konum_bul_parcalar(
         ai_result,
         web_mahalle=web_mahalle,
         web_ilce=web_ilce,
     )
 
-    if konum_sonucu is None:
+    for parca in sonuc.parcalar:
+        if parca.sonuc is None:
+            print(f"  [bulunamadı] {parca.etiket}")
+        else:
+            print(f"  [{parca.kesinlik}] {parca.etiket} -> {parca.sonuc.gosterim_adi}")
+            if parca.sonuc.uyari:
+                print(f"    UYARI: {parca.sonuc.uyari}")
+
+    geocode_sonucu = sonuc.geocode_sonucu()
+
+    if geocode_sonucu is None:
         print("Konum bulunamadı.")
         db.save_geocode_result(record_id, None)
         return
 
-    print(f"Konum bulundu ({konum_sonucu.kaynak}): {konum_sonucu.gosterim_adi}")
+    print(f"Konum bulundu: {geocode_sonucu['bulunan']}/{geocode_sonucu['toplam']} parça")
 
-    if not konum_sonucu.tam_eslesme:
-        print(f"UYARI: Yaklaşık/şüpheli eşleşme - {konum_sonucu.uyari}")
-
-    db.save_geocode_result(
-        record_id,
-        {
-            "latitude": konum_sonucu.lat,
-            "longitude": konum_sonucu.lon,
-            "display_name": konum_sonucu.gosterim_adi,
-            "tam_eslesme": konum_sonucu.tam_eslesme,
-            "uyari": konum_sonucu.uyari,
-            "kaynak": konum_sonucu.kaynak,
-        },
-    )
-
-    if konum_sonucu.geojson:
-        db.save_geometry(record_id, konum_sonucu.geojson)
-    else:
-        point_geometry = {
-            "type": "Point",
-            "coordinates": [konum_sonucu.lon, konum_sonucu.lat],
-        }
-        db.save_geometry(record_id, point_geometry)
+    db.save_geocode_result(record_id, geocode_sonucu)
+    db.save_geometry(record_id, sonuc.geometri())
 
 
 # ============================================================
@@ -450,7 +485,9 @@ def run_pipeline() -> None:
     # Web sitesi
     # --------------------------------------------------------
 
-    response = requests.get(URL, timeout=30)
+    with build_http_session() as session:
+        response = session.get(URL, timeout=30)
+
     response.raise_for_status()
 
     print(f"HTTP Durum Kodu: {response.status_code}")
@@ -464,8 +501,16 @@ def run_pipeline() -> None:
     target_table = find_target_table(soup)
 
     if target_table is None:
+        ipucu = ""
+        if "içerik bulunamadı" in response.text:
+            ipucu = (
+                " Sayfa 'Aradığınız içerik bulunamadı' diyor: .env içindeki URL "
+                "artık geçerli değil. Güncel adres: "
+                "https://www.denizli.bel.tr/hizli-erisim/trafige-kapali-yollar"
+            )
         raise RuntimeError(
             "GÜZERGAH, TARİH ve KAPANMA NEDENİ sütunlarını içeren tablo bulunamadı."
+            + ipucu
         )
 
     print("Hedef tablo bulundu.")

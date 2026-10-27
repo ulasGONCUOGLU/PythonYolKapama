@@ -154,6 +154,7 @@ def save_geocode_result(record_id: int, result: Optional[Dict[str, Any]]) -> Non
 
 
 def save_geometry(record_id: int, geometry: Optional[Dict[str, Any]]) -> None:
+    # Birden çok parça bulunduysa geometry bir GeometryCollection olabilir.
     if geometry is None:
         return
 
@@ -187,12 +188,18 @@ def get_pending_ai_records() -> List[Dict[str, Any]]:
         .execute()
     )
 
+    def eski_bicim(row: Dict[str, Any]) -> bool:
+        """Parça listesi (segments) eklenmeden önce analiz edilmiş kayıt: bir kez yeniden analiz edilir."""
+        sonuc = row.get("ai_result")
+        return isinstance(sonuc, dict) and "segments" not in sonuc and "error" not in sonuc
+
     return [
         row
         for row in response.data
         if row.get("ai_status") != "success"
         or row.get("ai_result") is None
         or row.get("ai_location_type") is None
+        or eski_bicim(row)
     ]
 
 
@@ -210,6 +217,13 @@ def get_pending_geocode_records() -> List[Dict[str, Any]]:
         .execute()
     )
 
+    def eksik_parca(row: Dict[str, Any]) -> bool:
+        """Parça bazlı sonuç yok (eski kayıt) ya da bazı parçalar bulunamamış: yeniden dene."""
+        sonuc = row.get("geocode_result")
+        if not isinstance(sonuc, dict) or "parcalar" not in sonuc:
+            return True
+        return sonuc.get("bulunan", 0) < sonuc.get("toplam", 0)
+
     return [
         row
         for row in response.data
@@ -218,6 +232,7 @@ def get_pending_geocode_records() -> List[Dict[str, Any]]:
             row.get("geocode_status") != "success"
             or row.get("geocode_result") is None
             or row.get("geometry") is None
+            or eksik_parca(row)
         )
     ]
 

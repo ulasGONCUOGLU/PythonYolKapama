@@ -36,23 +36,32 @@ copy .env.example .env
 ```
 
 Doldurman gereken alanlar: `URL`, `GEMINI_API_KEY`, `SUPABASE_URL`,
-`SUPABASE_SERVICE_ROLE_KEY`, `INTERNAL_API_TOKEN`.
+`SUPABASE_SERVICE_ROLE_KEY`, `INTERNAL_API_TOKEN`. Önerilen: `GEOCODER_CONTACT`
+(OpenStreetMap Nominatim politikası, uygulamayı tanıtan bir `User-Agent` ister;
+iletişim e-postanızı yazın). Diğer isteğe bağlı ayarlar `.env.example` içinde
+açıklanmıştır.
+
+> `.env` dosyası `.gitignore` içindedir; anahtarlarınızı asla depoya yüklemeyin.
+
+### Gemini modelini değiştirmek
+
+Model adı yalnızca bir metindir; **API anahtarı modelden bağımsızdır**, anahtarı
+aldığınız siteye gitmenize gerek yok. `.env` içine yazın ve yeniden başlatın:
+
+```
+GEMINI_MODEL=gemini-3.8-flash
+```
+
+Boş bırakırsanız `gemini-3.6-flash` kullanılır. Geçerli model ID'leri ve kapatma
+tarihleri: <https://ai.google.dev/gemini-api/docs/models> ve
+<https://ai.google.dev/gemini-api/docs/deprecations>. Modeli değiştirince birkaç
+gerçek kayıtla sonucu kontrol edin (konum tipi, mahalle/ilçe doğruluğu).
 
 ## Supabase şeması
 
-`supabase_schema_update.sql` dosyasını Supabase Dashboard → SQL Editor'e
-yapıştırıp çalıştırın. Bu, daha önce kurduğumuz `closures` tablosunu
-script'in gerçek ihtiyacına göre yeniden tanımlar (mock veri yapısından
-farklı — `record_hash`, `ai_status`, `geocode_status` gibi pipeline'a
-özel alanlar içeriyor) ve `refresh_active_status()` adında bir RPC
-fonksiyonu ekler.
+`supabase_schema_update.sql` dosyasını Supabase Dashboard → SQL Editor'e yapıştırıp çalıştırın. Dosya **tekrar çalıştırılabilir**; hiçbir tabloyu silmez, mevcut veriyi korur. Şunları kurar: `closures`, `sync_runs` ve `settings` tabloları, `refresh_active_status()` fonksiyonu ve güvenli RLS politikaları (`system_prompt` satırı dahil).
 
-> `settings` ve `sync_runs` tabloları önceki adımda zaten kurulmuştu,
-> bu dosya sadece `closures`'ı günceller.
-
-`settings` tablosunda `system_prompt` anahtarının bir satırı olduğundan
-emin olun (önceki SQL'de `insert ... on conflict do nothing` ile zaten
-eklenmişti).
+> **Güvenlik notu:** Eski sürümdeki şema dosyası bu üç tabloya `TO PUBLIC` INSERT/UPDATE/DELETE izni veriyordu. Tarayıcıdaki anon anahtar herkese göründüğü için bu, erişimi olan herkesin tabloları silebilmesi/değiştirebilmesi ve `settings` içindeki AI talimatını okuyup yazabilmesi demekti. Yeni dosya bu politikaları siler: tarayıcı yalnızca `closures` ve `sync_runs`'ı **okuyabilir**; yazma işlemlerini Flask ve Nuxt sunucusu `service_role` anahtarıyla yapar (RLS'i zaten atlar). Mevcut veritabanınızda bu dosyayı **bir kez** çalıştırın.
 
 ## Çalıştırma
 
@@ -104,15 +113,25 @@ tablosundan izleyebilirsiniz.
   `INTERNAL_API_TOKEN` container'a ortam değişkeni olarak geçilmeli
   (`.env` dosyasını image'a gömmeyin).
 
+## Nominatim / OSM kullanım kuralları
+
+Genel `nominatim.openstreetmap.org` sunucusu ücretsizdir ama kuralları vardır ([politika](https://operations.osmfoundation.org/policies/nominatim/)):
+
+- Saniyede en fazla 1 istek; düzenli/zamanlanmış çalışan betikler için sınır daha da düşüktür.
+- Tanıtıcı `User-Agent` zorunludur (`GEOCODER_CONTACT`).
+- Sonuçlar önbelleğe alınmalıdır. `konum.py` bunu otomatik yapar (`output/geocode_cache.sqlite`): aynı sorgu tekrar sunucuya gitmez, bulunamayan sorgular da 3 gün hatırlanır (`GEOCODE_CACHE_*` ayarları).
+
+Sık çalıştırıyorsanız veya çok kayıt işliyorsanız kendi Nominatim (ve OSRM) sunucunuza geçin; adreslerini `NOMINATIM_URL` ve `OSRM_URL` ile verin. Genel OSRM adresi (`router.project-osrm.org`) bir demo sunucudur; üretim için önerilmez.
+
 ## Dosyalar
 
 ```
 main.py                      Ana pipeline (scrape -> Supabase -> AI -> konum)
 AI_düzenleme.py               Gemini ile güzergah analizi (system_prompt Supabase'ten)
-konum.py                      Nominatim/OSRM geocoding (değişmedi)
+konum.py                      Nominatim/OSRM geocoding (önbellekli, Türkçe harf duyarlı)
 db_supabase.py                Supabase kalıcılık katmanı (SQLite'ın yerini alıyor)
 app.py                        Flask sarmalayıcısı (POST /run, GET /health)
-supabase_schema_update.sql    closures tablosunun güncel şeması + RPC
+supabase_schema_update.sql    Tüm tabloların güvenli, tekrar çalıştırılabilir şeması + RPC
 requirements.txt
 .env.example
 ```
